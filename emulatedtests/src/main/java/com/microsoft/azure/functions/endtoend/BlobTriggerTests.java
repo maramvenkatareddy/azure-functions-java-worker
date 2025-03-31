@@ -2,9 +2,6 @@ package com.microsoft.azure.functions.endtoend;
 
 import com.microsoft.azure.functions.annotation.*;
 
-import java.util.List;
-import java.util.Optional;
-
 import com.microsoft.azure.functions.*;
 
 /**
@@ -56,7 +53,7 @@ public class BlobTriggerTests {
         context.getLogger().info("Java Blob trigger function BlobTriggerStringTest processed a blob.\n Name: " + fileName + "\n Content: " + triggerBlobText);
         outputBlob.setValue(triggerBlobText);
     }
-    
+
     public static class TestBlobData {
       public String blobText;
   }
