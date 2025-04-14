@@ -28,8 +28,21 @@ public final class MethodBindInfo {
         return params;
     }
 
+    public boolean hasEffectiveReturnType(){
+        boolean nonVoidReturn = this.hasNonVoidReturnType();
+        // For function annotated with @HasImplicitOutput, we should allow it to send back data even function's return type is void
+        // Reference to https://github.com/microsoft/durabletask-java/issues/126
+        boolean implicitOutput = this.hasImplicitOutput();
+        return nonVoidReturn || implicitOutput;
+    }
+
     public boolean hasImplicitOutput() {
         return hasImplicitOutput;
+    }
+
+    public boolean hasNonVoidReturnType() {
+        Class<?> returnType = this.getMethod().getReturnType();
+        return !returnType.equals(void.class) && !returnType.equals(Void.class);
     }
 }
 

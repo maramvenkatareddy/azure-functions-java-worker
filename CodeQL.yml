@@ -1,0 +1,4 @@
+path_classifiers:
+  generated:
+    # Classify generated code.
+    - extract/inst

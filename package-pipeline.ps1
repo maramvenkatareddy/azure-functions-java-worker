@@ -1,113 +1,159 @@
 param (
-  [string]$buildNumber
+    [string]$buildNumber
 )
 
-# A function that checks exit codes and fails script if an error is found 
+# A helper function that stops the entire script if the last command failed.
 function StopOnFailedExecution {
-  if ($LastExitCode) 
-  { 
-    exit $LastExitCode 
-  }
+    if ($LastExitCode) {
+        exit $LastExitCode
+    }
 }
 
-$ApplicationInsightsAgentVersion = '3.5.4'
-$ApplicationInsightsAgentFilename = "applicationinsights-agent-${ApplicationInsightsAgentVersion}.jar"
-$ApplicationInsightsAgentUrl = "https://repo1.maven.org/maven2/com/microsoft/azure/applicationinsights-agent/${ApplicationInsightsAgentVersion}/${ApplicationInsightsAgentFilename}"
-
-Write-Host "Building azure-functions-java-worker" 
-mvn clean package --no-transfer-progress -B
+# --------------------------------------------------------------------
+# Build the azure-functions-java-worker (using the "appinsights" profile)
+# --------------------------------------------------------------------
+Write-Host "=== Building azure-functions-java-worker with 'appinsights' profile ==="
+mvn clean package --no-transfer-progress -B -P appinsights
 StopOnFailedExecution
 
-Write-Host "Creating nuget package Microsoft.Azure.Functions.JavaWorker" 
-Write-Host "buildNumber: " $buildNumber
-Get-Command nuget
+# --------------------------------------------------------------------
+# Prepare the final "pkg" folder and copy core worker artifacts
+# --------------------------------------------------------------------
+Write-Host "`n=== Creating NuGet package: Microsoft.Azure.Functions.JavaWorker ==="
+Write-Host "Using buildNumber: $buildNumber"
+
+# Ensure 'nuget' command is available
+Get-Command nuget | Out-Null
 StopOnFailedExecution
-remove-item pkg -Recurse -ErrorAction Ignore
-mkdir pkg
-Get-ChildItem -Path .\target\* -Include 'azure*' -Exclude '*shaded.jar','*tests.jar' | %{ Copy-Item $_.FullName .\pkg\azure-functions-java-worker.jar }
+
+Write-Host "Removing old 'pkg' folder (if present)..."
+Remove-Item -Recurse -Force -ErrorAction Ignore .\pkg
+
+Write-Host "Creating new 'pkg' folder..."
+New-Item -ItemType Directory -Path .\pkg | Out-Null
+
+Write-Host "Copying azure-functions-java-worker.jar to 'pkg'..."
+Get-ChildItem -Path .\target\* -Include 'azure*' -Exclude '*shaded.jar','*tests.jar' |
+        ForEach-Object { Copy-Item $_.FullName .\pkg\azure-functions-java-worker.jar }
 StopOnFailedExecution
-copy-item ./worker.config.json pkg
-copy-item ./tools/AzureFunctionsJavaWorker.nuspec pkg/
-copy-item ./annotationLib pkg/annotationLib -Recurse
 
-# Download application insights agent from maven central
-$ApplicationInsightsAgentFile = [System.IO.Path]::Combine($PSScriptRoot, $ApplicationInsightsAgentFilename)
+Write-Host "Copying supporting files into 'pkg' folder..."
+Copy-Item .\worker.config.json .\pkg\
+Copy-Item .\tools\AzureFunctionsJavaWorker.nuspec .\pkg\
+Copy-Item .\annotationLib .\pkg\annotationLib -Recurse
 
-# local testing cleanup
-if (Test-Path -Path $ApplicationInsightsAgentFile) {
-    Remove-Item -Path $ApplicationInsightsAgentFile
-}
-
-# local testing cleanup
-$oldOutput = [System.IO.Path]::Combine($PSScriptRoot, "agent")
-if (Test-Path -Path $oldOutput) {
-    Remove-Item -Path $oldOutput -Recurse
-}
-
-# local testing cleanup
-$oldExtract = [System.IO.Path]::Combine($PSScriptRoot, "extract")
-if (Test-Path -Path $oldExtract) {
-    Remove-Item -Path $oldExtract -Recurse
-}
-
-$extract = new-item -type directory -force $PSScriptRoot\extract
-if (-not(Test-Path -Path $extract)) {
-    echo "Fail to create a new directory $extract"
+# --------------------------------------------------------------------
+# Locate the Application Insights agent built by the Maven profile
+# --------------------------------------------------------------------
+$AgentSourcePath = Join-Path $PSScriptRoot 'target\agent\applicationinsights-agent.jar'
+if (!(Test-Path -Path $AgentSourcePath)) {
+    Write-Host "`nERROR: Application Insights agent not found at '$AgentSourcePath'."
+    Write-Host "Make sure you enabled the 'appinsights' Maven profile."
     exit 1
 }
 
-echo "Start downloading '$ApplicationInsightsAgentUrl' to '$PSScriptRoot'"
+# --------------------------------------------------------------------
+# Create a local 'agent' folder and copy the agent jar there
+# --------------------------------------------------------------------
+Write-Host "`n=== Setting up the agent folder ==="
+
+$AgentFolder = Join-Path $PSScriptRoot 'agent'
+$AgentFilename = 'applicationinsights-agent.jar'
+$PackagedAgentFile = Join-Path $AgentFolder $AgentFilename
+
+Write-Host "Removing old 'agent' folder (if present)..."
+if (Test-Path -Path $AgentFolder) {
+    Remove-Item -Recurse -Force $AgentFolder
+}
+
+Write-Host "Creating a new 'agent' folder..."
+New-Item -ItemType Directory -Path $AgentFolder | Out-Null
+
+Write-Host "Copying agent from '$AgentSourcePath' to '$PackagedAgentFile'..."
+Copy-Item $AgentSourcePath -Destination $PackagedAgentFile
+StopOnFailedExecution
+
+# --------------------------------------------------------------------
+# Remove signature files and adjust MANIFEST.MF in-place (no full extraction)
+# --------------------------------------------------------------------
+Write-Host "`n=== Removing signature files from '$PackagedAgentFile' ==="
+
+# Load .NET assemblies for ZipArchive on Windows
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+
+$fileStream = [System.IO.File]::Open($PackagedAgentFile, [System.IO.FileMode]::Open)
+$zipArchive = New-Object System.IO.Compression.ZipArchive($fileStream, [System.IO.Compression.ZipArchiveMode]::Update)
+
 try {
-    Invoke-WebRequest -Uri $ApplicationInsightsAgentUrl -OutFile $ApplicationInsightsAgentFile
-} catch {
-    echo "An error occurred. Download fails" $ApplicationInsightsAgentFile
-    echo "Exiting"
-    exit 1
+    Write-Host "Deleting signature files from META-INF..."
+    $entriesToRemove = $zipArchive.Entries | Where-Object {
+        $_.FullName -like "META-INF/MSFTSIG.*" `
+        -or $_.FullName -like "META-INF/*.SF" `
+        -or $_.FullName -like "META-INF/*.RSA" `
+        -or $_.FullName -like "META-INF/*.DSA"
+    }
+
+    foreach ($entry in $entriesToRemove) {
+        Write-Host "  Removing: $($entry.FullName)"
+        $entry.Delete()
+    }
+
+    Write-Host "Checking MANIFEST.MF for extra signature references..."
+    $manifestEntry = $zipArchive.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" }
+    if ($manifestEntry) {
+        $reader = New-Object System.IO.StreamReader($manifestEntry.Open())
+        $manifestContent = $reader.ReadToEnd()
+        $reader.Close()
+
+        # Regex to remove blank line(s) after the main attributes
+        $pattern = '(?sm)^(.*?\r?\n)\r?\n'
+        $matches = [regex]::Matches($manifestContent, $pattern)
+
+        if ($matches.Count -gt 0) {
+            Write-Host "  Removing signature-related lines after main attributes."
+            $cleanedManifest = $matches[0].Groups[1].Value
+
+            $manifestEntry.Delete()
+
+            $newManifestEntry = $zipArchive.CreateEntry("META-INF/MANIFEST.MF")
+            $writer = New-Object System.IO.StreamWriter($newManifestEntry.Open())
+            $writer.Write($cleanedManifest)
+            $writer.Flush()
+            $writer.Close()
+
+            Write-Host "  MANIFEST.MF updated successfully."
+        }
+        else {
+            Write-Host "  No extra blank lines found in MANIFEST.MF."
+        }
+    }
+    else {
+        Write-Host "No MANIFEST.MF found in the JAR (unexpected?)."
+    }
+}
+finally {
+    # Always dispose archive and file streams
+    $zipArchive.Dispose()
+    $fileStream.Dispose()
 }
 
-if (-not(Test-Path -Path $ApplicationInsightsAgentFile)) {
-    echo "$ApplicationInsightsAgentFile do not exist."
-    exit 1
-}
+Write-Host "Done removing signature files from '$PackagedAgentFile'."
 
-echo "Start extracting content from $ApplicationInsightsAgentFilename to extract folder"
-cd -Path $extract -PassThru
-jar xf $ApplicationInsightsAgentFile
-cd $PSScriptRoot
-echo "Done extracting"
+# --------------------------------------------------------------------
+# Add 'functions.codeless' marker and copy agent folder to 'pkg'
+# --------------------------------------------------------------------
+Write-Host "`n=== Creating 'functions.codeless' marker file ==="
+New-Item -Path $AgentFolder -Name "functions.codeless" -ItemType File | Out-Null
 
-echo "Unsign $ApplicationInsightsAgentFilename"
-Remove-Item $extract\META-INF\MSFTSIG.*
-$manifest = "$extract\META-INF\MANIFEST.MF"
-$newContent = (Get-Content -Raw $manifest | Select-String -Pattern '(?sm)^(.*?\r?\n)\r?\n').Matches[0].Groups[1].Value
-Set-Content -Path $manifest $newContent
+Write-Host "Copying 'agent' folder into the 'pkg' folder..."
+Copy-Item $AgentFolder (Join-Path $PSScriptRoot 'pkg\agent') -Recurse -Force -Verbose
 
-Remove-Item $ApplicationInsightsAgentFile
-if (-not(Test-Path -Path $ApplicationInsightsAgentFile)) {
-    echo "Delete the original $ApplicationInsightsAgentFilename successfully"
-} else {
-    echo "Fail to delete original source $ApplicationInsightsAgentFilename"
-    exit 1
-}
-
-$agent = new-item -type directory -force $PSScriptRoot\agent
-$filename = "applicationinsights-agent.jar"
-$result = [System.IO.Path]::Combine($agent, $filename)
-echo "re-jar $filename"
-
-cd -Path $extract -PassThru
-jar cfm $result META-INF/MANIFEST.MF .
-
-if (-not(Test-Path -Path $result)) {
-    echo "Fail to re-archive $filename"
-    exit 1
-}
-Write-Host "Creating the functions.codeless file"
-New-Item -path $PSScriptRoot\agent -type file -name "functions.codeless"
-
-cd $PSScriptRoot
-Copy-Item $PSScriptRoot/agent $PSScriptRoot/pkg/agent -Recurse -Verbose
-
-set-location pkg
+# --------------------------------------------------------------------
+# Package everything into the final NuGet package
+# --------------------------------------------------------------------
+Write-Host "`n=== Creating the NuGet package ==="
+Push-Location pkg
 nuget pack -Properties version=$buildNumber
-set-location ..
+Pop-Location
+
+Write-Host "`n=== Script completed successfully. NuGet package created. ==="

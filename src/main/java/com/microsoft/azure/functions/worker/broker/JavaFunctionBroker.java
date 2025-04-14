@@ -7,6 +7,7 @@ import java.net.URL;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.microsoft.azure.functions.cache.CacheKey;
 import com.microsoft.azure.functions.internal.spi.middleware.Middleware;
 import com.microsoft.azure.functions.rpc.messages.*;
 import com.microsoft.azure.functions.spi.inject.FunctionInstanceInjector;
@@ -16,10 +17,14 @@ import com.microsoft.azure.functions.worker.binding.BindingDataStore;
 import com.microsoft.azure.functions.worker.binding.ExecutionContextDataSource;
 import com.microsoft.azure.functions.worker.binding.ExecutionRetryContext;
 import com.microsoft.azure.functions.worker.binding.ExecutionTraceContext;
+import com.microsoft.azure.functions.worker.cache.WorkerObjectCache;
 import com.microsoft.azure.functions.worker.chain.FunctionExecutionMiddleware;
 import com.microsoft.azure.functions.worker.chain.InvocationChainFactory;
+import com.microsoft.azure.functions.worker.chain.SdkTypeMiddleware;
 import com.microsoft.azure.functions.worker.description.FunctionMethodDescriptor;
 import com.microsoft.azure.functions.worker.reflect.ClassLoaderProvider;
+import com.microsoft.azure.functions.sdktype.SdkParameterAnalysisResult;
+import com.microsoft.azure.functions.sdktype.SdkParameterAnalyzer;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 
@@ -37,6 +42,12 @@ public class JavaFunctionBroker {
 	private volatile InvocationChainFactory invocationChainFactory;
 	private volatile FunctionInstanceInjector functionInstanceInjector;
 	private final Object oneTimeLogicInitializationLock = new Object();
+	private List<Middleware> baseMiddlewares = new ArrayList<>();
+	private final Map<String, InvocationChainFactory> functionFactories = new ConcurrentHashMap<>();
+	private final SdkParameterAnalyzer sdkParameterAnalyzer = new SdkParameterAnalyzer();
+	private final WorkerObjectCache<CacheKey> workerObjectCache;
+	private static final boolean JAVA_ENABLE_SDK_TYPES_FLAG =
+			Boolean.parseBoolean(System.getenv("JAVA_ENABLE_SDK_TYPES"));
 
 	private FunctionInstanceInjector newInstanceInjector() {
 		return new FunctionInstanceInjector() {
@@ -50,6 +61,11 @@ public class JavaFunctionBroker {
 	public JavaFunctionBroker(ClassLoaderProvider classLoaderProvider) {
 		this.methods = new ConcurrentHashMap<>();
 		this.classLoaderProvider = classLoaderProvider;
+		if (JAVA_ENABLE_SDK_TYPES_FLAG) {
+			this.workerObjectCache = new WorkerObjectCache<>();
+		} else {
+			this.workerObjectCache = null;
+		}
 	}
 
 	public void loadMethod(FunctionMethodDescriptor descriptor, Map<String, BindingInfo> bindings)
@@ -58,14 +74,49 @@ public class JavaFunctionBroker {
 		addSearchPathsToClassLoader(descriptor);
 		initializeOneTimeLogics();
 		FunctionDefinition functionDefinition = new FunctionDefinition(descriptor, bindings, classLoaderProvider);
+
+		if (JAVA_ENABLE_SDK_TYPES_FLAG) {
+			createInvocationChainFactory(functionDefinition, bindings);
+		}
+
 		this.methods.put(descriptor.getId(), new ImmutablePair<>(descriptor.getName(), functionDefinition));
+	}
+
+	private void createInvocationChainFactory(FunctionDefinition functionDefinition, Map<String, BindingInfo> bindings) {
+		SdkParameterAnalysisResult sdkParameterAnalysisResult =
+				this.sdkParameterAnalyzer.analyze(functionDefinition.getCandidate().getMethod());
+
+		ClassLoader classLoader = this.classLoaderProvider.createClassLoader();
+		List<Middleware> functionMws = new ArrayList<>(this.baseMiddlewares);
+		boolean hasAnySdkTypes = sdkParameterAnalysisResult.hasAnySdkTypes();
+
+		if (hasAnySdkTypes) {
+			functionMws.add(new SdkTypeMiddleware(classLoader,
+					sdkParameterAnalysisResult.getSdkTypesMetaData(),
+					this.sdkParameterAnalyzer.getRegistry()));
+		}
+
+		functionMws.add(getFunctionExecutionMiddleWare(classLoader));
+
+		InvocationChainFactory factory = new InvocationChainFactory(functionMws);
+		String functionId = functionDefinition.getDescriptor().getId();
+		this.functionFactories.put(functionId, factory);
+
+		WorkerLogManager.getSystemLogger().info("Created custom invocationChainFactory for function "
+				+ functionId + ", supportsDeferredBinding=" + hasAnySdkTypes);
 	}
 
 	private void initializeOneTimeLogics() {
 		if (!oneTimeLogicInitialized) {
 			synchronized (oneTimeLogicInitializationLock) {
 				if (!oneTimeLogicInitialized) {
-					initializeInvocationChainFactory();
+
+					if (JAVA_ENABLE_SDK_TYPES_FLAG) {
+						loadGlobalMiddlewares();
+					} else {
+						initializeInvocationChainFactory();
+					}
+
 					initializeFunctionInstanceInjector();
 					oneTimeLogicInitialized = true;
 				}
@@ -73,12 +124,27 @@ public class JavaFunctionBroker {
 		}
 	}
 
-	private void initializeInvocationChainFactory() {
-		ArrayList<Middleware> middlewares = new ArrayList<>();
+	private void loadGlobalMiddlewares() {
 		ClassLoader prevContextClassLoader = Thread.currentThread().getContextClassLoader();
 		try {
 			//ServiceLoader will use thread context classloader to verify loaded class
 			Thread.currentThread().setContextClassLoader(classLoaderProvider.createClassLoader());
+			for (Middleware middleware : ServiceLoader.load(Middleware.class)) {
+				this.baseMiddlewares.add(middleware);
+				WorkerLogManager.getSystemLogger().info("Loading discovered middleware " + middleware.getClass().getSimpleName());
+			}
+		} finally {
+			Thread.currentThread().setContextClassLoader(prevContextClassLoader);
+		}
+	}
+
+	private void initializeInvocationChainFactory() {
+		ArrayList<Middleware> middlewares = new ArrayList<>();
+		ClassLoader prevContextClassLoader = Thread.currentThread().getContextClassLoader();
+		ClassLoader newContextClassLoader = classLoaderProvider.createClassLoader();
+		try {
+			//ServiceLoader will use thread context classloader to verify loaded class
+			Thread.currentThread().setContextClassLoader(newContextClassLoader);
 			for (Middleware middleware : ServiceLoader.load(Middleware.class)) {
 				middlewares.add(middleware);
 				WorkerLogManager.getSystemLogger().info("Load middleware " + middleware.getClass().getSimpleName());
@@ -86,7 +152,7 @@ public class JavaFunctionBroker {
 		} finally {
 			Thread.currentThread().setContextClassLoader(prevContextClassLoader);
 		}
-		middlewares.add(getFunctionExecutionMiddleWare());
+		middlewares.add(getFunctionExecutionMiddleWare(newContextClassLoader));
 		this.invocationChainFactory = new InvocationChainFactory(middlewares);
 	}
 
@@ -112,9 +178,9 @@ public class JavaFunctionBroker {
 		}
 	}
 
-	private FunctionExecutionMiddleware getFunctionExecutionMiddleWare() {
+	private FunctionExecutionMiddleware getFunctionExecutionMiddleWare(ClassLoader classLoader) {
 		FunctionExecutionMiddleware functionExecutionMiddleware = new FunctionExecutionMiddleware(
-				JavaMethodExecutors.createJavaMethodExecutor(this.classLoaderProvider.createClassLoader()));
+				JavaMethodExecutors.createJavaMethodExecutor(classLoader));
 		WorkerLogManager.getSystemLogger().info("Load last middleware: FunctionExecutionMiddleware");
 		return functionExecutionMiddleware;
 	}
@@ -122,7 +188,13 @@ public class JavaFunctionBroker {
 	public Optional<TypedData> invokeMethod(String id, InvocationRequest request, List<ParameterBinding> outputs)
 			throws Exception {
 		ExecutionContextDataSource executionContextDataSource = buildExecutionContext(id, request);
-		this.invocationChainFactory.create().doNext(executionContextDataSource);
+
+		if (JAVA_ENABLE_SDK_TYPES_FLAG) {
+			this.functionFactories.get(id).create().doNext(executionContextDataSource);
+		} else {
+			this.invocationChainFactory.create().doNext(executionContextDataSource);
+		}
+
 		outputs.addAll(executionContextDataSource.getDataStore().getOutputParameterBindings(true));
 		return executionContextDataSource.getDataStore().getDataTargetTypedValue(BindingDataStore.RETURN_NAME);
 	}
@@ -142,9 +214,17 @@ public class JavaFunctionBroker {
 				request.getTraceContext().getTraceState(), request.getTraceContext().getAttributesMap());
 		ExecutionRetryContext retryContext = new ExecutionRetryContext(request.getRetryContext().getRetryCount(),
 				request.getRetryContext().getMaxRetryCount(), request.getRetryContext().getException());
-		ExecutionContextDataSource executionContextDataSource = new ExecutionContextDataSource(request.getInvocationId(),
-				traceContext, retryContext, methodEntry.left, dataStore, functionDefinition.getCandidate(),
-				functionDefinition.getContainingClass(), request.getInputDataList(), this.functionInstanceInjector);
+		ExecutionContextDataSource executionContextDataSource = new ExecutionContextDataSource(
+				request.getInvocationId(),
+				traceContext,
+				retryContext,
+				methodEntry.left,
+				dataStore,
+				functionDefinition.getCandidate(),
+				functionDefinition.getContainingClass(),
+				request.getInputDataList(),
+				this.functionInstanceInjector,
+				this.workerObjectCache);
 		dataStore.addExecutionContextSource(executionContextDataSource);
 		return executionContextDataSource;
 	}

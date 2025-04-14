@@ -4,8 +4,8 @@
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 
-	<groupId>com.microsoft.azure.functions.endtoendtests</groupId>
-	<artifactId>azure-functions-java-endtoendtests</artifactId>
+	<groupId>com.microsoft.azure.functions.emulatedtests</groupId>
+	<artifactId>azure-functions-java-emulatedtests</artifactId>
 	<version>1.0-SNAPSHOT</version>
 	<packaging>jar</packaging>
 
@@ -21,15 +21,16 @@
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<java.version>1.8</java.version>
-		<azure.functions.maven.plugin.version>1.18.0</azure.functions.maven.plugin.version>
+		<azure.functions.maven.plugin.version>1.37.1</azure.functions.maven.plugin.version>
 		<azure.functions.java.library.version>3.1.0</azure.functions.java.library.version>
 		<azure.functions.java.library.sql.version>2.1.0</azure.functions.java.library.sql.version>
-		<azure.functions.java.library.mysql.version>1.0.2</azure.functions.java.library.mysql.version>
 		<durabletask.azure.functions>1.0.0-beta.1</durabletask.azure.functions>
-		<functionAppName>azure-functions-java-endtoendtests</functionAppName>
+		<functionAppName>azure-functions-java-emulatedtests</functionAppName>
 		<functionAppRegion>westus</functionAppRegion>
 		<functionResourceGroup>java-functions-group</functionResourceGroup>
 		<start-class>com.microsoft.azure.functions.endtoend.springcloud.Config</start-class>
+		<!-- Empty by default: no exclusion -->
+		<excludedClassPattern>**/___noop___.java</excludedClassPattern>
 	</properties>
 
 	<repositories>
@@ -70,11 +71,6 @@
             <groupId>com.microsoft.azure.functions</groupId>
             <artifactId>azure-functions-java-library-sql</artifactId>
             <version>${azure.functions.java.library.sql.version}</version>
-        </dependency>
-		<dependency>
-            <groupId>com.microsoft.azure.functions</groupId>
-            <artifactId>azure-functions-java-library-mysql</artifactId>
-            <version>${azure.functions.java.library.mysql.version}</version>
         </dependency>
 		<dependency>
 			<groupId>com.microsoft</groupId>
@@ -118,6 +114,11 @@
 			<artifactId>spring-cloud-starter-function-web</artifactId>
 			<scope>provided</scope>
 		</dependency>
+		<dependency>
+			<groupId>com.azure</groupId>
+			<artifactId>azure-storage-blob</artifactId>
+			<version>12.29.0</version>
+		</dependency>
 	</dependencies>
 
 	<dependencyManagement>
@@ -142,6 +143,9 @@
 					<source>${java.version}</source>
 					<target>${java.version}</target>
 					<encoding>${project.build.sourceEncoding}</encoding>
+					<excludes>
+						<exclude>${excludedClassPattern}</exclude>
+					</excludes>
 				</configuration>
 			</plugin>
 			<plugin>
