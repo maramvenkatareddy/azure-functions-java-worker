@@ -18,7 +18,6 @@
     "AzureWebJobsEventGridOutputBindingTopicUriString": "",
     "AzureWebJobsEventGridOutputBindingTopicKeyString": "",
     "AzureWebJobsSqlConnectionString": "",
-    "AzureWebJobsMySqlConnectionString": "",
     "FUNCTIONS_WORKER_RUNTIME": "java"
   }
 }
