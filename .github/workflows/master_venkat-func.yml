@@ -6,7 +6,7 @@ name: Build and deploy Java project to Azure Function App - venkat-func
 on:
   push:
     branches:
-      - master
+      - dev
   workflow_dispatch:
 
 env:
